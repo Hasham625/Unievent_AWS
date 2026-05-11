@@ -2,7 +2,6 @@
 
 ## Prerequisites
 
-Before deploying, you need:
 
 1. **An AWS account** (new accounts get $100 in free credits)
 2. **A Ticketmaster API key** — sign up at https://developer.ticketmaster.com/
