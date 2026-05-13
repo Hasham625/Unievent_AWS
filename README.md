@@ -1,238 +1,317 @@
+# UniEvent — Scalable University Event Management System on AWS
+
+![AWS](https://img.shields.io/badge/AWS-Cloud-orange?logo=amazonaws)
+![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python)
+![Flask](https://img.shields.io/badge/Flask-3.x-black?logo=flask)
+![License](https://img.shields.io/badge/Course-CE%20308%2F408-green)
+
+> **Course:** CE 308/408 Cloud Computing — Assignment 1
+> **Institution:** Ghulam Ishaq Khan Institute of Engineering Sciences and Technology
+> **Topic:** Deployment of a Scalable University Event Management System on AWS
+
+---
+
+## Table of Contents
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [AWS Services Used](#aws-services-used)
+4. [Open API Choice](#open-api-choice)
+5. [Repository Structure](#repository-structure)
+6. [Prerequisites](#prerequisites)
+7. [Deployment Guide](#deployment-guide)
+8. [Verifying the Six Requirements](#verifying-the-six-requirements)
+9. [Fault-Tolerance Demonstration](#fault-tolerance-demonstration)
+10. [Teardown](#teardown)
+11. [Cost Estimate](#cost-estimate)
+12. [Security Considerations](#security-considerations)
+13. [Future Improvements](#future-improvements)
+14. [Author](#author)
+
+---
+
+## Overview
+
+**UniEvent** is a cloud-hosted web application where students can browse the
+university events portal. Rather than manual entry, the system automatically
+fetches event data from the **Ticketmaster Discovery API** (a public Open API)
+and renders those events as "University Events" on the UniEvent platform.
+Event poster images are cached to a private, encrypted **Amazon S3** bucket.
+
+The platform is built to be:
+- **Secure** — private subnets, least-privilege IAM, encrypted S3, defence-in-depth security groups
+- **Scalable** — Auto Scaling Group with `min=2`, `max=4` instances
+- **Fault-tolerant** — multi-AZ deployment, ALB health checks, systemd auto-restart
+- **Cost-aware** — `t3.micro` instances, AES-256 SSE-S3 (free) instead of KMS
+
+---
+
+## Architecture
+
+```
+                          Internet
+                              │
+                       [ Internet Gateway ]
+                              │
+       ┌──────────────────────┴──────────────────────┐
+       │                                             │
+   Public Subnet A (10.0.1.0/24)               Public Subnet B (10.0.2.0/24)
+   ┌───────────────┐                           ┌───────────────┐
+   │  ALB Node     │ ◄────────────────────────►│  ALB Node     │
+   │  + NAT GW     │                           │               │
+   └───────┬───────┘                           └───────┬───────┘
+           │       (defence-in-depth SGs)              │
+           ▼                                           ▼
+   Private Subnet A (10.0.3.0/24)              Private Subnet B (10.0.4.0/24)
+   ┌───────────────┐                           ┌───────────────┐
+   │ EC2 (Flask)   │                           │ EC2 (Flask)   │
+   │ systemd svc   │                           │ systemd svc   │
+   └───────┬───────┘                           └───────┬───────┘
+           └───────────────────┬───────────────────────┘
+                               │ (egress via NAT GW)
+                               ▼
+                  Ticketmaster Discovery API
+                               │
+                               ▼
+                       ┌──────────────┐
+                       │  S3 Bucket   │
+                       │  AES-256 SSE │
+                       │  Block PubAcc│
+                       │  (posters)   │
+                       └──────────────┘
+```
+
+For full design justification, see
+**[`architecture/ARCHITECTURE.md`](architecture/ARCHITECTURE.md)**.
+
+---
+
+## AWS Services Used
+
+| Service                    | Role in UniEvent                                                   |
+| -------------------------- | ------------------------------------------------------------------ |
+| **VPC**                    | Custom `10.0.0.0/16` network with 2 public + 2 private subnets across two AZs (us-east-1a, us-east-1b) |
+| **Internet Gateway**       | Allows the ALB to receive public traffic                            |
+| **NAT Gateway**            | Allows private EC2 instances to call the external Ticketmaster API |
+| **IAM**                    | Instance role + profile granting least-privilege S3 access only    |
+| **EC2 (Amazon Linux 2023)**| Hosts the Flask application as a `systemd` service                  |
+| **Auto Scaling Group**     | Maintains 2 healthy instances (`max=4`), spread across both AZs    |
+| **Application Load Balancer** | Public entry point; health-checks `/health` on each target      |
+| **S3**                     | Stores event posters; SSE-AES256 + Block Public Access enforced   |
+| **Security Groups**        | ALB-SG (public:80) and EC2-SG (only from ALB-SG) — layered defence |
+
+---
+
+## Open API Choice
+
+We chose the **Ticketmaster Discovery API** for the following reasons:
+
+| Criterion         | Why Ticketmaster                                                  |
+| ----------------- | ----------------------------------------------------------------- |
+| **Free tier**     | 5,000 calls/day — comfortably enough for periodic polling         |
+| **Data quality**  | Returns `name`, `dates.start.localDate`, venue, info, image URLs  |
+| **Format**        | Structured JSON, trivial to parse with Python's `requests`        |
+| **Auth model**    | Simple `apikey` query parameter — no OAuth handshake needed       |
+| **Reliability**   | Production-grade API used by major ticketing partners worldwide   |
+
+Endpoint used: `GET https://app.ticketmaster.com/discovery/v2/events.json`
+
+---
+
+## Repository Structure
+
+```
+unievent/
+├── README.md                       ← this file
+├── .gitignore
+│
+├── app/
+│   ├── app.py                      ← Flask app (event fetch + poster cache + UI)
+│   └── requirements.txt            ← Python dependencies
+│
+├── infrastructure/
+│   ├── deploy.sh                   ← AWS CLI script — provisions everything
+│   ├── teardown.sh                 ← AWS CLI script — deletes everything
+│   └── userdata.sh                 ← EC2 user-data template (installed by deploy.sh)
+│
+└── architecture/
+    └── ARCHITECTURE.md             ← detailed design justification
+```
+
 ---
 
 ## Prerequisites
 
+Before deploying, make sure you have:
 
-1. **An AWS account** (new accounts get $100 in free credits)
-2. **A Ticketmaster API key** — sign up at https://developer.ticketmaster.com/
-3. **AWS region selected** — this guide uses `ap-south-1` (Mumbai); adjust if you prefer another region
+1. **An AWS account** with permissions to create IAM, VPC, EC2, S3, and ELB resources
+   (the `AdministratorAccess` managed policy is fine for the assignment, then revoke after).
+
+2. **AWS CLI v2** installed on macOS:
+   ```bash
+   curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o AWSCLIV2.pkg
+   sudo installer -pkg AWSCLIV2.pkg -target /
+   aws --version
+   ```
+
+3. **Configured credentials:**
+   ```bash
+   aws configure
+   # AWS Access Key ID:     <from IAM console>
+   # AWS Secret Access Key: <from IAM console>
+   # Default region name:   us-east-1
+   # Default output format: json
+   ```
+
+4. **A Ticketmaster API key** (free):
+   - Sign up at https://developer.ticketmaster.com
+   - Copy the *Consumer Key* from your app
+
+5. **`python3`** available locally (used by the deploy script to render user-data).
 
 ---
 
 ## Deployment Guide
 
-The full step-by-step deployment is described in the design document. The summary:
+```bash
+# 1. Clone the repository
+git clone https://github.com/<your-username>/unievent.git
+cd unievent
 
-### 1. Store the API Key
+# 2. Configure your secret (.env is gitignored - safe from leaks)
+cp .env.example .env
+# then edit .env and paste your Ticketmaster Consumer Key
 
-Create a secret in **AWS Secrets Manager** named `unievent/ticketmaster` with:
-```json
-{ "apikey": "YOUR_TICKETMASTER_KEY" }
+# 3. Load env vars and run the deploy
+set -a; source .env; set +a
+chmod +x infrastructure/deploy.sh infrastructure/teardown.sh
+./infrastructure/deploy.sh
 ```
 
-### 2. Build the VPC
+The script prints the **ALB DNS name** at the end:
 
-Use the **VPC Wizard** ("VPC and more"):
-- Name: `unievent`
-- CIDR: `10.0.0.0/16`
-- 2 Availability Zones, 2 public subnets, 2 private subnets
-- NAT Gateway: in 1 AZ (cheaper) or 1 per AZ (production)
-- S3 Gateway VPC Endpoint: enabled
+```
+============================================================
+DEPLOYMENT COMPLETE
+============================================================
+VPC:        vpc-0abc123
+S3 Bucket:  unievent-posters-1715712345
+ALB DNS:    http://unievent-alb-123456789.us-east-1.elb.amazonaws.com
 
-### 3. Create the S3 Bucket
+Allow ~4 minutes for EC2 instances to boot and register
+with the target group, then visit the URL above.
+============================================================
+```
 
-- Name: `unievent-media-<your-account-id>`
-- Block Public Access: **all four boxes ticked**
-- Versioning: **enabled**
-- Encryption: **SSE-S3**
-- Bucket policy: apply `policies/s3-bucket-policy.json` (TLS-only)
-
-### 4. Create the IAM Role
-
-- Role name: `UniEventAppRole`
-- Trust: EC2 service
-- Policies attached:
-  - `AmazonSSMManagedEC2InstanceDefaultPolicy` (AWS managed) — for Session Manager
-  - `UniEventAppPolicy` (inline) — from `policies/iam-role-policy.json`
-
-### 5. Create Security Groups
-
-| Name | Inbound | Outbound |
-|---|---|---|
-| `alb-sg` | HTTP/HTTPS from `0.0.0.0/0` | All traffic to `0.0.0.0/0` |
-| `app-sg` | HTTP from `alb-sg` only | All traffic to `0.0.0.0/0` |
-
-> ⚠️ Make sure `app-sg`'s outbound rule allows **all traffic** — instances need to reach AWS APIs, package mirrors, and Ticketmaster.
-
-### 6. Create the Launch Template
-
-- Name: `unievent-template`
-- AMI: Amazon Linux 2023 (free tier eligible)
-- Instance type: `t3.micro`
-- Security group: `app-sg`
-- IAM instance profile: `UniEventAppRole`
-- User data: paste contents of `user-data.sh`
-- Update the `S3_BUCKET` environment variable in the script to match your bucket name
-
-### 7. Create the Application Load Balancer
-
-- **Target group** `unievent-tg`:
-  - Protocol: HTTP, Port: 80
-  - Health check path: `/health`
-  - Healthy threshold: 2, Unhealthy threshold: 3
-- **ALB** `unievent-alb`:
-  - Scheme: Internet-facing
-  - Subnets: both public subnets
-  - Security group: `alb-sg`
-  - Listener: HTTP:80 → forward to `unievent-tg`
-
-### 8. Create the Auto Scaling Group
-
-- Name: `unievent-asg`
-- Launch template: `unievent-template`
-- Subnets: both **private** subnets
-- Attach to existing load balancer → `unievent-tg`
-- Health check type: **EC2, ELB**
-- Health check grace period: **120 seconds**
-- Desired: 2, Min: 2, Max: 6
-- Scaling policy: target tracking, average CPU 50%
-
-### 9. Test
-
-After ~5 minutes:
-- Target Group shows 2 **healthy** instances
-- Visit the ALB DNS name in a browser → see the UniEvent homepage with real events
+Wait ~4 minutes (EC2 boot + `pip install` + service start), then open the URL
+in your browser. You should see the **University Events** page rendered from
+live Ticketmaster data.
 
 ---
 
-## How It Works
+## Verifying the Six Requirements
 
-### Request lifecycle (user-facing)
-
-1. User opens the ALB URL in a browser
-2. ALB picks a healthy EC2 instance and forwards the HTTP request
-3. EC2 reads cached events from memory; if cache is empty, reads `data/events-latest.json` from S3
-4. EC2 renders an HTML page showing event cards (each with poster, title, venue, date)
-5. ALB returns the response to the browser
-
-### Background ingestion lifecycle
-
-1. Each EC2 runs a systemd timer (`unievent-fetch.timer`) that triggers every 15 minutes
-2. The fetcher attempts to acquire a lock file in S3 (`locks/ingestion.lock`) — only one instance wins
-3. The winner:
-   - Fetches the Ticketmaster API key from Secrets Manager (via IAM role)
-   - Calls `https://app.ticketmaster.com/discovery/v2/events.json` (outbound via NAT Gateway)
-   - Normalizes events to the UniEvent schema
-   - Writes the result to `s3://<bucket>/data/events-latest.json`
-4. Other instances refresh their cache from S3 every 2 minutes and see the new events
-
-### Concurrency control
-
-The S3 lock file prevents multiple instances from calling Ticketmaster simultaneously and burning rate-limit quota. The lock is best-effort (cooperative), which is fine for a 15-minute cycle.
+| # | Requirement                                       | How to Verify                                                                                                  |
+| - | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| 1 | App runs on multiple EC2 instances in private subnets | `aws ec2 describe-instances --filters "Name=tag:aws:autoscaling:groupName,Values=unievent-asg"` — look at `SubnetId`s (they are private) and the absence of public IPs |
+| 2 | App periodically fetches event data from an Open API | See [`app/app.py`](app/app.py) → `fetch_events()` — every page render calls Ticketmaster                       |
+| 3 | Retrieved data processed and stored                | JSON parsed in `fetch_events()`, posters PUT to S3 in `cache_poster_to_s3()`                                   |
+| 4 | Event posters stored securely in S3                | `aws s3api get-bucket-encryption --bucket unievent-posters-…` returns AES256; PAB blocks all public access     |
+| 5 | App displays events as "University Events"         | Page heading is literally "University Events" — open the ALB URL in a browser                                  |
+| 6 | System continues operating if one EC2 instance fails | See [Fault-Tolerance Demonstration](#fault-tolerance-demonstration) below                                      |
 
 ---
 
-## Security
+## Fault-Tolerance Demonstration
 
-Defense in depth across layers:
+Manually terminate one instance and confirm the app keeps serving:
 
-**Network layer**
-- Application servers in private subnets (no public IPs)
-- Security groups deny-by-default
-- ALB is the only public ingress point
-- S3 traffic uses VPC Gateway Endpoint (never traverses the public internet)
+```bash
+# Pick one of the running instances
+INST=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names unievent-asg \
+  --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
 
-**Identity layer**
-- No static AWS credentials on instances — IAM Instance Role only
-- Least-privilege policy: only the two S3 prefixes and one Secrets Manager entry the app actually needs
-- Session Manager replaces SSH (no port 22 open anywhere)
+# Kill it
+aws ec2 terminate-instances --instance-ids "$INST"
 
-**Data layer**
-- S3 Block Public Access enabled (all four settings)
-- S3 default encryption: SSE-S3 (AES-256)
-- S3 bucket policy denies any non-TLS request
-- S3 versioning enabled (recovers from accidental overwrites)
+# Refresh the ALB URL in your browser - the app is STILL up,
+# served by the surviving instance in the other AZ.
 
-**Secret layer**
-- Ticketmaster API key in AWS Secrets Manager
-- Fetched at boot via IAM role — never in source code, AMIs, or environment variables baked into images
+# Within 2-3 minutes, the ASG launches a replacement
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names unievent-asg \
+  --query 'AutoScalingGroups[0].Instances'
+```
 
----
-
-## Fault Tolerance
-
-| Failure | Behavior |
-|---|---|
-| One EC2 crashes | ALB health check fails → traffic shifts to surviving instance → ASG launches replacement |
-| Entire AZ goes offline | ALB stops routing to that AZ → ASG launches replacements in surviving AZ |
-| Ticketmaster API outage | Background fetch fails; app continues serving the last successful events from S3 |
-| Bad deployment | ASG instance refresh has built-in rollback if new instances fail health checks |
-| Compromised application | Blast radius limited to two S3 prefixes + one secret (IAM least privilege) |
-
----
-
-## Cost
-
-Approximate monthly costs (Mumbai region, on-demand pricing):
-
-| Component | Cost |
-|---|---|
-| 2× t3.micro EC2 (24/7) | ~$8 |
-| Application Load Balancer | ~$18 |
-| 1× NAT Gateway | ~$32 |
-| S3 (minimal usage) | <$1 |
-| Secrets Manager (1 secret) | $0.40 |
-| **Total** | **~$60/month** |
-
-> 💡 New AWS accounts get $100 in credits — more than enough for a 1-week assignment demo. For a one-week deployment with active testing, expect to use ~$15–25 of credits.
+This is the screenshot you want for **requirement #6**.
 
 ---
 
 ## Teardown
 
-To avoid unnecessary charges, delete resources in this order:
+The deployment provisions billable resources (NAT Gateway ≈ \$1.08/day, ALB ≈
+\$0.54/day). **Run the teardown script after grading** to avoid charges:
 
-1. Auto Scaling Group → Delete
-2. Load Balancer → Delete
-3. Target Group → Delete
-4. Launch Template → Delete
-5. NAT Gateway → Delete (wait 2 min)
-6. Elastic IPs → Release (VPC console)
-7. S3 bucket → Empty → Delete
-8. Secrets Manager → Schedule deletion (7-day minimum)
-9. VPC → Delete VPC
-10. IAM role and policies → Delete (optional)
-11. (Optional) Close AWS account: root user → Account → Close Account
+```bash
+cd infrastructure
+./teardown.sh
+```
+
+The script deletes the ASG, Launch Template, ALB, Target Group, NAT Gateway,
+Elastic IPs, S3 bucket (including objects), IAM role + profile, subnets,
+route tables, IGW, and finally the VPC itself.
 
 ---
 
-## Troubleshooting
+## Cost Estimate
 
-### Targets stuck in "Unhealthy"
+For a single day of running this assignment:
 
-1. Verify `app-sg` inbound allows HTTP from `alb-sg`
-2. Verify `app-sg` outbound allows **all traffic** (not just port 80)
-3. Connect via Session Manager and check `sudo journalctl -u unievent.service`
-4. Check `/var/log/unievent-setup.log` for boot script errors
+| Resource           | Approx. Cost / day | Notes                           |
+| ------------------ | ------------------ | ------------------------------- |
+| NAT Gateway        | \$1.08             | $0.045/hr + data-processing     |
+| Application LB     | \$0.54             | $0.0225/hr + LCU                |
+| 2× t3.micro EC2    | Free tier eligible | Otherwise ≈ \$0.50/day total    |
+| S3 storage         | < \$0.01           | A few MB of posters             |
+| Elastic IP (NAT)   | Free while attached |                                |
+| **Total**          | **≈ \$1.60/day**   | Without free tier               |
 
-### Session Manager grey / "SSM Agent unable to acquire credentials"
+---
 
-This means the instance has no internet. Check:
-1. NAT Gateway state is "Available" and in a **public** subnet
-2. Both private route tables have route `0.0.0.0/0 → nat-...`
-3. `app-sg` outbound allows all traffic to `0.0.0.0/0`
+## Security Considerations
 
-### Page shows "No events loaded yet"
+- **Defence in depth at the network layer** — EC2 instances are unreachable
+  from the internet because (a) they live in private subnets with no public IPs
+  and (b) their security group only allows traffic *from the ALB security group*,
+  not from `0.0.0.0/0`.
+- **Least-privilege IAM** — the EC2 instance role can only `PutObject`,
+  `GetObject`, and `ListBucket` on the UniEvent bucket. No wildcards, no
+  `AmazonS3FullAccess`.
+- **No long-lived AWS credentials on disk** — `boto3` uses the IMDSv2 instance
+  role for authentication; no access keys are baked into the AMI or code.
+- **API key isolation** — the Ticketmaster key lives in a systemd `Environment=`
+  directive on the EC2 instance only. It is never committed to git
+  (`.gitignore` covers `.env`).
+- **Encryption at rest** — S3 objects are encrypted with AES-256 (SSE-S3) by
+  default. KMS is not used to stay within free-tier billing.
+- **Block Public Access** is enforced on the S3 bucket with all four flags ON,
+  so even an accidental ACL change cannot make objects public.
 
-1. Wait 1–2 minutes for the first fetch cycle
-2. Connect to an instance via Session Manager
-3. Run: `sudo journalctl -u unievent-fetch.service -n 50`
-4. Verify the Secrets Manager secret has key `apikey` (not `key` or `value`)
-5. Verify the bucket name in the systemd Environment matches your actual bucket
+---
 
-### Auto Scaling Group keeps launching/terminating instances
+## Future Improvements
 
-Usually means health checks are failing. Check:
-1. Target group is attached to the ASG (Integrations tab)
-2. `app-sg` inbound rule allows HTTP from `alb-sg`
-3. Health check grace period is at least 120 seconds (boot script needs time)
+- **CloudFront + ACM** for HTTPS termination at the edge
+- **CloudWatch Alarms** to scale the ASG on `CPUUtilization > 70%`
+- **Secrets Manager** to store the Ticketmaster key instead of an env var
+- **ElastiCache (Redis)** to cache the Ticketmaster JSON for a 5-min TTL
+- **CodeDeploy / blue-green deployments** for zero-downtime app releases
+- **WAF** on the ALB to filter common web attacks
+- **Terraform / CloudFormation** to make the deploy script declarative
 
 ---
 
 ## Author
 
-Submitted as part of the CE 308/408 Cloud Computing course at GIKI.
-
-## License
-
-This project is for academic purposes.
+Built for **CE 308/408 Cloud Computing — Assignment 1** at
+Ghulam Ishaq Khan Institute of Engineering Sciences and Technology.
